@@ -14,9 +14,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Fine-tuning the library models for sequence to sequence.
+文件说明：main.py - ChatMed-LLaMA模型训练与评估主程序（PEFT版本）
+
+本文件主要功能：
+1. 基于LLaMA模型使用LoRA进行参数高效微调(PEFT)
+2. 支持训练(train)和评估(eval)两种模式
+3. 使用因果语言模型(Causal LM)架构处理医疗对话任务
+4. 支持DeepSpeed分布式训练和梯度检查点
+5. 集成wandb进行训练监控
+
+模型架构：
+- 基础模型：LlamaForCausalLM
+- 微调方法：LoRA (Low-Rank Adaptation)
+- 分词器：LlamaTokenizer
+
+LoRA配置说明：
+- target_modules: 应用LoRA的模块（如q_proj, v_proj等）
+- r: LoRA秩（影响参数量和表达能力）
+- lora_alpha: LoRA缩放因子
+- lora_dropout: LoRA层的dropout率
+
+使用方法：
+    训练：python src/chatmed_llama_peft/main.py --do_train --train_file xxx --model_name_or_path xxx
+    评估：python src/chatmed_llama_peft/main.py --do_eval --validation_file xxx
+
+作者：项目开发团队
 """
-# You can also adapt this script on your own sequence to sequence task. Pointers for this are left as comments.
+# 可以根据自己的序列到序列任务调整此脚本，代码中留有相应的注释说明
 
 import logging
 import os
@@ -50,7 +74,7 @@ from transformers import (
 
 from typing import Optional, List, Dict, Any, Mapping
 sys.path.append("./")
-os.environ['CUDA_VISIBLE_DEVICES']='0,1,2,3'
+os.environ['CUDA_VISIBLE_DEVICES']='0,1,2,3'  # 指定使用的GPU设备
 
 from transformers import (
     LlamaTokenizer,
@@ -64,26 +88,40 @@ from src.chatmed_llama_peft.trainer import Trainer
 from src.chatmed_llama_peft.arguments import ModelArguments, DataTrainingArguments
 from src.chatmed_llama_peft.instruction import TASK_TO_INSTRUCTION, TASK_TO_MAX_NEW_TOKENS
 
-
 from peft import PeftModel, LoraConfig, TaskType, PeftModelForCausalLM, get_peft_model, get_peft_model_state_dict
 
+# 初始化日志记录器
 logger = logging.getLogger(__name__)
 
+
 def main():
+    """
+    主函数：训练、评估的入口函数
     
+    功能流程：
+    1. 解析命令行参数或JSON配置文件
+    2. 初始化wandb进行训练监控
+    3. 加载预训练LLaMA模型和分词器
+    4. 配置LoRA参数并应用PEFT
+    5. 构建训练/验证数据集
+    6. 初始化自定义Trainer并执行训练/评估
+    7. 保存结果和指标
+    """
+    # 解析参数：支持JSON文件或命令行参数
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
-        # If we pass only one argument to the script and it's the path to a json file,
-        # let's parse it to get our arguments.
+        # 如果只传入一个JSON文件参数，则从该文件解析配置
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    # 初始化wandb进行实验追踪
     wandb.init(
         project='llama_peft',
         name=training_args.run_name
     )
-    # Setup logging
+    
+    # 配置日志格式和处理器
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
@@ -91,27 +129,28 @@ def main():
     )
         
     if training_args.should_log:
-        # The default of training_args.log_level is passive, so we set log level at info here to have that default.
+        # 默认的log_level是passive，这里设置为info级别
         transformers.utils.logging.set_verbosity_info()
 
     log_level = training_args.get_process_log_level()
     logger.setLevel(log_level)
-    # datasets.utils.logging.set_verbosity(log_level)
     transformers.utils.logging.set_verbosity(log_level)
     transformers.utils.logging.enable_default_handler()
     transformers.utils.logging.enable_explicit_format()
 
-    # Log on each process the small summary:
+    # 记录每个进程的小结
     logger.warning(
         f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
         + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
     )
     logger.info(f"Training/evaluation parameters {training_args}")
 
-    # Set seed before initializing model.
+    # 在模型初始化前设置随机种子，确保可复现性
     set_seed(training_args.seed)
 
-    # Load dataset
+    # =========================================
+    # 加载数据集文件配置
+    # =========================================
     data_files = {}
     if data_args.train_file is not None:
         data_files["train"] = data_args.train_file
@@ -129,47 +168,45 @@ def main():
         cache_dir=model_args.cache_dir,
         use_auth_token=True if model_args.use_auth_token else None,
     )
-    # print("raw_datasets: ", raw_datasets)
     
-    config = LlamaConfig.from_pretrained(
-        model_args.model_name_or_path,
-        # trust_remote_code=True
-    )
+    # =========================================
+    # 加载预训练LLaMA模型和分词器
+    # =========================================
+    config = LlamaConfig.from_pretrained(model_args.model_name_or_path)
 
-
-    tokenizer = LlamaTokenizer.from_pretrained(
-        model_args.model_name_or_path,
-        # trust_remote_code=True
-    )
+    tokenizer = LlamaTokenizer.from_pretrained(model_args.model_name_or_path)
 
     model = LlamaForCausalLM.from_pretrained(
-            model_args.model_name_or_path,
-            config=config,
+        model_args.model_name_or_path,
+        config=config,
     ).cuda()
     
+    # 训练时使用半精度以节省显存
     if training_args.do_train:
         model = model.half()
     
-
-    # for n, p in model.named_parameters():
-    #     print(n, p.requires_grad)
-
-    # model.resize_token_embeddings(len(tokenizer))
+    # =========================================
+    # 配置LoRA并应用PEFT
+    # =========================================
     if model_args.peft_path is not None:
+        # 从预训练的PEFT模型加载（用于继续训练或预测）
         logger.info("Peft from pre-trained model")
         logger.info("Only load for prediction")
         peft_config = LoraConfig.from_pretrained(model_args.peft_path)
         model = get_peft_model(model, peft_config)
         model = PeftModelForCausalLM.from_pretrained(model, model_args.peft_path, is_trainable=False)
     else:
+        # 初始化新的PEFT模型
         logger.info("Init new peft model")
-        target_modules = model_args.trainable.split(',')
+        target_modules = model_args.trainable.split(',')  # LoRA应用的目标模块
         modules_to_save = model_args.modules_to_save.split(',') if model_args.modules_to_save!="null" else None
-        lora_rank = model_args.lora_rank
-        lora_dropout = model_args.lora_dropout
-        lora_alpha = model_args.lora_alpha
+        lora_rank = model_args.lora_rank      # LoRA秩
+        lora_dropout = model_args.lora_dropout  # Dropout率
+        lora_alpha = model_args.lora_alpha      # 缩放因子
         print(target_modules)
         print(lora_rank)
+        
+        # 创建LoRA配置
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             target_modules=target_modules[0],
@@ -179,30 +216,23 @@ def main():
             modules_to_save=modules_to_save
         )
         model = get_peft_model(model, peft_config)
-    model.print_trainable_parameters()
     
-    # old_state_dict = model.state_dict
-    # model.state_dict = (
-    #     lambda self, *_, **__: get_peft_model_state_dict(self, old_state_dict())
-    # ).__get__(model, type(model))
-    # for n, p in model.named_parameters():
-    #     print(n, p.requires_grad)
-
-    # for n, p in model.named_parameters():
-    #     print(n, p.requires_grad, p.numel())
+    # 打印可训练参数信息
+    model.print_trainable_parameters()
         
+    # 量化设置（可选）
     if model_args.quantization_bit is not None:
         print(f"Quantized to {model_args.quantization_bit} bit")
         model = model.quantize(model_args.quantization_bit)
 
-
-    
-    # Get the column names for input/target.
+    # 配置数据整理器
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     eval_dataset = None
     train_dataset = None
     
-    
+    # =========================================
+    # 配置序列长度
+    # =========================================
     if data_args.block_size is None:
         block_size = tokenizer.model_max_length
         if block_size > 1024:
@@ -219,6 +249,9 @@ def main():
             )
         block_size = min(data_args.block_size, tokenizer.model_max_length)
     
+    # =========================================
+    # 构建训练数据集
+    # =========================================
     if training_args.do_train:
         with training_args.main_process_first(desc="loading and tokenization"):
             files = [data_args.train_file]
@@ -232,6 +265,10 @@ def main():
         logger.info(f"Num train_samples  {len(train_dataset)}")
         logger.info("training example:")
         logger.info(tokenizer.decode(train_dataset[0]['input_ids']))
+        
+    # =========================================
+    # 构建验证数据集
+    # =========================================
     if training_args.do_eval:
         with training_args.main_process_first(desc="loading and tokenization"):
             files = [data_args.validation_file]
@@ -247,8 +284,13 @@ def main():
         logger.info(tokenizer.decode(eval_dataset[0]['input_ids']))
         
     
-    
     def print_dataset_example(example):
+        """
+        打印数据集样例，用于调试和验证数据预处理
+        
+        参数：
+            example: dict - 包含input_ids和labels的数据样例
+        """
         print("input_ids",example["input_ids"])
         print("inputs", tokenizer.decode(example["input_ids"]))
         print("label_ids", len(example["labels"]))
@@ -256,13 +298,21 @@ def main():
         print("labels", tokenizer.decode(labels))
     
 
-    # Metric
     def compute_metrics(eval_preds):
+        """
+        计算评估指标：ROUGE和BLEU
+        
+        参数：
+            eval_preds: tuple - (预测结果, 标签)
+        
+        返回：
+            dict - 包含rouge-1, rouge-2, rouge-l, bleu-4的指标字典
+        """
         preds, labels = eval_preds
         if isinstance(preds, tuple):
             preds = preds[0]
+        # 处理padding token
         if data_args.ignore_pad_token_for_loss:
-            # Replace -100 in the labels as we can't decode them.
             preds = np.where(preds != -100, preds, tokenizer.pad_token_id)
             labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
         decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
@@ -274,6 +324,7 @@ def main():
             "rouge-l": [],
             "bleu-4": []
         }
+        # 计算每个样本的指标
         for pred, label in zip(decoded_preds, decoded_labels):
             hypothesis = list(jieba.cut(pred))
             reference = list(jieba.cut(label))
@@ -286,18 +337,38 @@ def main():
             bleu_score = sentence_bleu([list(label)], list(pred), smoothing_function=SmoothingFunction().method3)
             score_dict["bleu-4"].append(round(bleu_score * 100, 4))
 
+        # 计算平均值
         for k, v in score_dict.items():
             score_dict[k] = float(np.mean(v))
         return score_dict
 
     def preprocess_logits_for_metrics(logits, labels):
+        """
+        预处理logits用于指标计算
+        
+        参数：
+            logits: tensor或tuple - 模型输出的logits
+            labels: tensor - 真实标签
+        
+        返回：
+            tensor - argmax后的预测结果
+        """
         if isinstance(logits, tuple):
-            # Depending on the model and config, logits may contain extra tensors,
-            # like past_key_values, but logits always come first
             logits = logits[0]
         return logits.argmax(dim=-1)
     
     def fault_tolerance_data_collator(features: List) -> Dict[str, Any]:
+        """
+        容错数据整理器
+        
+        在批处理时处理可能的异常情况，确保训练稳定性
+        
+        参数：
+            features: List - 特征列表
+        
+        返回：
+            Dict[str, torch.Tensor] - 批处理后的数据
+        """
         import torch
 
         if not isinstance(features[0], Mapping):
@@ -305,9 +376,7 @@ def main():
         first = features[0]
         batch = {}
 
-        # Special handling for labels.
-        # Ensure that tensor is created with the correct type
-        # (it should be automatically the case, but let's make sure of it.)
+        # 特殊处理labels字段
         if "label" in first and first["label"] is not None:
             label = first["label"].item() if isinstance(first["label"], torch.Tensor) else first["label"]
             dtype = torch.long if isinstance(label, int) else torch.float
@@ -319,9 +388,7 @@ def main():
                 dtype = torch.long if type(first["label_ids"][0]) is int else torch.float
                 batch["labels"] = torch.tensor([f["label_ids"] for f in features], dtype=dtype)
 
-        # Handling of all other possible keys.
-        # Again, we will use the first element to figure out which key/values are not None for this model.
-
+        # 处理其他字段
         try:
             for k, v in first.items():
                 if k not in ("label", "label_ids") and v is not None and not isinstance(v, str):
@@ -331,7 +398,8 @@ def main():
                         batch[k] = torch.tensor(np.stack([f[k] for f in features]))
                     else:
                         batch[k] = torch.tensor([f[k] for f in features])
-        except ValueError: # quick fix by simply take the first example
+        except ValueError:
+            # 容错处理：使用第一个样本填充
             for k, v in first.items():
                 if k not in ("label", "label_ids") and v is not None and not isinstance(v, str):
                     if isinstance(v, torch.Tensor):
@@ -343,13 +411,14 @@ def main():
 
         return batch
     
-    # TODO: 试下fault_tolerance_data_collator
-    # setting trainer.evaluate with model.generate()
+    # 配置生成参数
     training_args.predict_with_generate = True
     task = data_args.task_name
     data_args.max_new_tokens = TASK_TO_MAX_NEW_TOKENS[task]
     
-    # Initialize our Trainer
+    # =========================================
+    # 初始化自定义Trainer
+    # =========================================
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -361,23 +430,22 @@ def main():
         compute_metrics=compute_metrics if training_args.do_eval and not is_torch_tpu_available() else None,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics
         if training_args.do_eval and not is_torch_tpu_available() else None,
-        callbacks=[SavePeftModelCallback],
+        callbacks=[SavePeftModelCallback],  # 保存PEFT模型的回调
     )
 
-
-    # Training
+    # =========================================
+    # 执行训练
+    # =========================================
     if training_args.do_train:
         checkpoint = None
         if training_args.resume_from_checkpoint is not None:
             checkpoint = training_args.resume_from_checkpoint
-        # elif last_checkpoint is not None:
-        #     checkpoint = last_checkpoint
         logger.info(f"load checkpoint from {training_args.resume_from_checkpoint}")
+        
+        # 启用梯度检查点以节省显存
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        # trainer.save_model()
-        # trainer.save_model()  # Saves the tokenizer too for easy upload
 
         metrics = train_result.metrics
         max_train_samples = (
@@ -389,12 +457,16 @@ def main():
         trainer.save_metrics("train", metrics)
         trainer.save_state()
 
-    # Evaluation
+    # =========================================
+    # 执行评估
+    # =========================================
     results = {}
     if training_args.do_eval:
         metrics = trainer.evaluate()
         max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
         metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
+        
+        # 计算困惑度
         try:
             perplexity = math.exp(metrics["eval_loss"])
         except OverflowError:
@@ -404,55 +476,20 @@ def main():
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
 
+    # 预测功能（已注释，可根据需要启用）
     # if training_args.do_predict:
-    #     logger.info("*** Predict ***")
-
-    #     # 读取原test file
-    #     list_test_samples = []
-    #     with open(data_args.test_file, "r", encoding="utf-8") as f:
-    #         for line in f:
-    #             line = json.loads(line)
-    #             list_test_samples.append(line)
-
-    #     predict_results = trainer.predict(
-    #         predict_dataset,
-    #     )
-    #     metrics = predict_results.metrics
-    #     print(metrics)
-    #     max_predict_samples = (
-    #         data_args.max_predict_samples if data_args.max_predict_samples is not None else len(predict_dataset)
-    #     )
-    #     metrics["predict_samples"] = min(max_predict_samples, len(predict_dataset))
-
-    #     trainer.log_metrics("predict", metrics)
-    #     trainer.save_metrics("predict", metrics)
-
-    #     if trainer.is_world_process_zero():
-    #         if training_args.predict_with_generate:
-    #             predictions = tokenizer.batch_decode(
-    #                 predict_results.predictions, skip_special_tokens=True, clean_up_tokenization_spaces=True
-    #             )
-    #             predictions = [pred.strip() for pred in predictions]
-    #             labels = tokenizer.batch_decode(
-    #                 predict_results.label_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
-    #             )
-    #             labels = [label.strip() for label in labels]
-    #             assert len(labels) == len(list_test_samples)
-
-    #             output_prediction_file = os.path.join(training_args.output_dir, "test_predictions.json")
-
-    #             with open(output_prediction_file, "w", encoding="utf-8") as writer:
-    #                 for idx, (p, l) in enumerate(zip(predictions, labels)):
-    #                     samp = list_test_samples[idx]
-    #                     samp["target"] = p
-    #                     res = json.dumps(samp, ensure_ascii=False)
-    #                     writer.write(f"{res}\n")
+    #     ...
 
     return results
 
 
 def _mp_fn(index):
-    # For xla_spawn (TPUs)
+    """
+    TPU训练的多进程入口函数
+    
+    参数：
+        index: int - 进程索引
+    """
     main()
 
 
