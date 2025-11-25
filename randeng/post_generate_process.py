@@ -1,12 +1,43 @@
 # coding=utf-8
 # Created by Michael Zhu
 # ECNU, 2023
+"""
+文件说明：post_generate_process.py - 模型输出后处理模块
+
+本文件主要功能：
+1. 对模型的原始预测结果进行后处理和格式化
+2. 将模型输出转换为PromptCBLUE评测所需的标准格式
+3. 针对不同任务类型应用特定的输出解析规则
+4. 处理实体去重、标签还原、格式修正等问题
+
+支持的16种任务后处理：
+- CMeEE-V2: 命名实体识别结果解析
+- CMeIE: 关系三元组抽取结果解析
+- CHIP-CDN: 诊断标准化结果解析
+- CHIP-CDEE: 临床事件抽取结果解析
+- CHIP-STS: 语义相似度判断还原
+- CHIP-CTC: 临床试验分类标签还原
+- CHIP-MDCFNPC: 阴阳性判断标记还原
+- KUAKE-IR/QIC/QQR/QTR: 搜索相关任务处理
+- IMCS-V2系列: 对话相关任务处理
+- MedDG: 医学对话生成结果处理
+
+使用方法：
+    python post_generate_process.py <input_file> <output_file>
+    例如：python post_generate_process.py ./exp/predictions.json ./exp/results.json
+
+作者：Michael Zhu (ECNU, 2023)
+"""
 
 import json
 import sys
 
-# NOTE: no extra Python dependency package are allowed
+# 注意：此脚本不允许引入额外的Python依赖包，以保证评测环境兼容性
 
+# =========================================
+# 罗马数字转换映射表
+# 用于处理医学文本中常见的罗马数字（如分期、分级等）
+# =========================================
 str2Roman = {
     "I": "Ⅰ",
     "II": "Ⅱ",
@@ -36,39 +67,135 @@ Roman2str = {
     "Ⅺ": "XI",
     "Ⅻ": "XII",
 }
-# Sort the mapping rules by length in descending order
+
+# 按字符串长度降序排序，确保长匹配优先
 str2Roman = dict(sorted(str2Roman.items(), key=lambda item: len(item[0]), reverse=True))
 Roman2str = dict(sorted(Roman2str.items(), key=lambda item: len(item[1]), reverse=True))
 
+
 def convert_str2roman(sent):
+    """
+    将ASCII罗马数字转换为Unicode罗马数字
+    
+    参数：
+        sent: str - 输入文本
+    
+    返回：
+        str - 转换后的文本
+    
+    示例：
+        "Stage III" -> "Stage Ⅲ"
+    """
     for str_roman, unicode_roman in str2Roman.items():
         sent = sent.replace(str_roman, unicode_roman)
     return sent
 
+
 def convert_roman2str(sent):
+    """
+    将Unicode罗马数字转换为ASCII罗马数字
+    
+    参数：
+        sent: str - 输入文本
+    
+    返回：
+        str - 转换后的文本
+    
+    示例：
+        "Stage Ⅲ" -> "Stage III"
+    """
     for unicode_roman, str_roman in Roman2str.items():
         sent = sent.replace(unicode_roman, str_roman)
     return sent
 
+
 def convert_eng2chn(sent):
+    """
+    将英文标点转换为中文标点
+    
+    参数：
+        sent: str - 输入文本
+    
+    返回：
+        str - 转换后的文本
+    """
     return sent.replace(',', "，").replace('(','（').replace(')', '）')
 
+
 def convert_chn2eng(sent):
+    """
+    将中文标点转换为英文标点
+    
+    参数：
+        sent: str - 输入文本
+    
+    返回：
+        str - 转换后的文本
+    """
     return sent.replace('，', ',').replace('（', '(').replace('）', ')')
 
+
 def contains_roman_keys(sentence):
+    """
+    检查句子中是否包含Unicode罗马数字
+    
+    参数：
+        sentence: str - 输入文本
+    
+    返回：
+        bool - 是否包含罗马数字
+    """
     for key in Roman2str.keys():
         if key in sentence:
             return True
     return False
 
+
 def prefix_match(target, word_list):
+    """
+    前缀匹配：查找以target开头且长度>=5的词
+    
+    参数：
+        target: str - 目标前缀
+        word_list: list - 候选词列表
+    
+    返回：
+        list - 匹配的词列表
+    """
     return [word for word in word_list if word.startswith(target) and len(word) >= 5]
 
+
 def partial_match(target, word_list):
+    """
+    部分匹配：查找包含target的词
+    
+    参数：
+        target: str - 目标子串
+        word_list: list - 候选词列表
+    
+    返回：
+        list - 匹配的词列表
+    """
     return [word for word in word_list if target in word]
 
+
 def process_generated_results(pred_file):
+    """
+    处理模型生成的预测结果，转换为评测所需的标准格式
+    
+    参数：
+        pred_file: str - 预测结果文件路径（JSON Lines格式）
+    
+    返回：
+        dict - 按任务类型分组的结构化输出
+            格式：{task_name: [{sample_id: ..., answer: ...}, ...]}
+    
+    功能：
+        1. 读取预测结果文件
+        2. 根据任务类型分发到相应的处理逻辑
+        3. 解析模型输出，提取结构化信息
+        4. 处理标签还原、实体去重等问题
+    """
 
     structured_output = {
         "CMeEE-V2": [],
@@ -691,15 +818,23 @@ def process_generated_results(pred_file):
     return structured_output
 
 
+# =========================================
+# 命令行入口
+# 使用方法：python post_generate_process.py <input_file> <output_file>
+# =========================================
 if __name__ == "__main__":
+    # 从命令行获取输入输出路径
+    from_dir = sys.argv[1]  # 模型预测结果文件路径
+    to_dir = sys.argv[2]    # 处理后结果保存路径
     
-    from_dir = sys.argv[1]
-    to_dir = sys.argv[2]
-    structured_outputs = process_generated_results(
-        from_dir
-    )
+    # 处理预测结果
+    structured_outputs = process_generated_results(from_dir)
+    
+    # 打印各任务的样本数量统计
     for key in structured_outputs.keys():
         print(key, len(structured_outputs[key]))
+    
+    # 保存结果为JSON格式
     json.dump(
         structured_outputs,
         open(to_dir, "w", encoding="utf-8"),
