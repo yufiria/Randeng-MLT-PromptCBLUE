@@ -1,21 +1,59 @@
+#!/bin/bash
+# =========================================
+# 文件说明：train.sh - Randeng-T5模型训练脚本
+#
+# 本脚本主要功能：
+# 1. 配置分布式训练环境（多GPU）
+# 2. 设置训练参数和数据路径
+# 3. 启动Randeng-T5模型的训练
+#
+# 使用方法：
+#   bash scripts/train.sh
+#
+# 配置项说明：
+#   - CUDA_VISIBLE_DEVICES: 指定使用的GPU设备
+#   - your_data_path: 数据集路径
+#   - your_checkpoint_path: 继续训练的检查点路径
+#   - output_path: 训练输出路径
+#   - model_path: 预训练模型路径
+#   - LR: 学习率
+#
+# 主要训练参数：
+#   - max_source_length: 输入序列最大长度
+#   - max_target_length: 目标序列最大长度
+#   - per_device_train_batch_size: 每个设备的批次大小
+#   - gradient_accumulation_steps: 梯度累积步数
+#   - max_steps: 最大训练步数
+# =========================================
+
 # build_instruction_dataset work with usual format 
 export CUDA_VISIBLE_DEVICES='2, 3'
 export WANDB_LOG_MODEL=true
 # export WANDB_MODE=disabled
+
+# 自动计算GPU数量
 gpu_num=$(echo $CUDA_VISIBLE_DEVICES | awk -F ',' '{print NF}')
 echo $gpu_num $CUDA_VISIBLE_DEVICES
 
-your_data_path="datasets/PromptCBLUE"  # dataset folder
-your_checkpoint_path=checkpoint/randen/new-verb-checkpoint-6000  # checkpoint folder
-output_path="checkpoint/randeng-aug-verb"  # output folder
-model_path=IDEA-CCNL/Randeng-T5-784M-MultiTask-Chinese
+# =========================================
+# 路径配置（请根据实际情况修改）
+# =========================================
+your_data_path="datasets/PromptCBLUE"  # 数据集所在文件夹
+your_checkpoint_path=checkpoint/randen/new-verb-checkpoint-6000  # 检查点文件夹（用于继续训练）
+output_path="checkpoint/randeng-aug-verb"  # 输出文件夹
+model_path=IDEA-CCNL/Randeng-T5-784M-MultiTask-Chinese  # 预训练模型路径
 
-# config for deepspeed
+# DeepSpeed配置文件（可选）
 deepspeed_config_file="src/chatmed_llama_peft/deepspeed_stage2.json"
 
-# experiment setting
-LR=1e-6
+# =========================================
+# 训练超参数配置
+# =========================================
+LR=1e-6  # 学习率
 
+# =========================================
+# 启动分布式训练
+# =========================================
 torchrun \
     --nnodes 1 \
     --nproc_per_node $gpu_num \
