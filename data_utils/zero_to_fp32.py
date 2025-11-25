@@ -5,12 +5,31 @@
 
 # DeepSpeed Team
 
-# This script extracts fp32 consolidated weights from a zero 2 and 3 DeepSpeed checkpoints. It gets
-# copied into the top level checkpoint dir, so the user can easily do the conversion at any point in
-# the future. Once extracted, the weights don't require DeepSpeed and can be used in any
-# application.
-#
-# example: python zero_to_fp32.py . pytorch_model.bin
+"""
+文件说明：zero_to_fp32.py - DeepSpeed ZeRO检查点转换工具
+
+本文件主要功能：
+1. 将DeepSpeed ZeRO Stage 2/3的分布式检查点转换为标准PyTorch FP32模型
+2. 支持从多个GPU分片恢复完整模型权重
+3. 转换后的模型可以在不依赖DeepSpeed的环境中使用
+
+使用方法：
+    python zero_to_fp32.py <checkpoint_dir> <output_file>
+    例如：python zero_to_fp32.py ./checkpoint pytorch_model.bin
+
+支持的ZeRO阶段：
+- ZeRO Stage 2: 优化器状态分片
+- ZeRO Stage 3: 参数分片
+
+注意事项：
+- 需要安装DeepSpeed库（用于解析检查点格式）
+- 转换后的模型权重会加载到CPU内存中
+- 对于大模型，确保有足够的CPU内存
+
+作者：Microsoft DeepSpeed Team
+"""
+
+# 使用示例: python zero_to_fp32.py . pytorch_model.bin
 
 import argparse
 import torch
@@ -21,8 +40,8 @@ import re
 from collections import OrderedDict
 from dataclasses import dataclass
 
-# while this script doesn't use deepspeed to recover data, since the checkpoints are pickled with
-# DeepSpeed data structures it has to be available in the current python environment.
+# 虽然此脚本不使用DeepSpeed来恢复数据，但由于检查点是使用DeepSpeed数据结构序列化的，
+# 因此需要在当前Python环境中安装DeepSpeed
 from deepspeed.utils import logger
 from deepspeed.checkpoint.constants import (DS_VERSION, OPTIMIZER_STATE_DICT, SINGLE_PARTITION_OF_FP32_GROUPS,
                                             FP32_FLAT_GROUPS, ZERO_STAGE, PARTITION_COUNT, PARAM_SHAPES, BUFFER_NAMES,
@@ -31,6 +50,19 @@ from deepspeed.checkpoint.constants import (DS_VERSION, OPTIMIZER_STATE_DICT, SI
 
 @dataclass
 class zero_model_state:
+    """
+    ZeRO模型状态数据类
+    
+    用于存储从检查点中解析出的模型状态信息
+    
+    属性：
+        buffers: dict - 模型缓冲区（如BatchNorm的running_mean等）
+        param_shapes: dict - 参数形状信息
+        shared_params: list - 共享参数列表
+        ds_version: int - DeepSpeed版本号
+        frozen_param_shapes: dict - 冻结参数的形状信息
+        frozen_param_fragments: dict - 冻结参数的片段数据
+    """
     buffers: dict()
     param_shapes: dict()
     shared_params: list
@@ -39,30 +71,62 @@ class zero_model_state:
     frozen_param_fragments: dict()
 
 
+# 调试模式开关
 debug = 0
 
-# load to cpu
+# 将模型加载到CPU
 device = torch.device('cpu')
 
 
 def atoi(text):
+    """
+    将文本转换为整数（如果是数字）
+    
+    参数：
+        text: str - 输入文本
+    
+    返回：
+        int或str - 如果是数字则返回整数，否则返回原字符串
+    """
     return int(text) if text.isdigit() else text
 
 
 def natural_keys(text):
-    '''
-    alist.sort(key=natural_keys) sorts in human order
-    http://nedbatchelder.com/blog/200712/human_sorting.html
-    (See Toothy's implementation in the comments)
-    '''
+    """
+    用于自然排序的键函数
+    
+    实现人类友好的排序方式，例如：
+    file1, file2, file10 而不是 file1, file10, file2
+    
+    参数：
+        text: str - 待排序的文本
+    
+    返回：
+        list - 用于排序比较的键列表
+    
+    参考：http://nedbatchelder.com/blog/200712/human_sorting.html
+    """
     return [atoi(c) for c in re.split(r'(\d+)', text)]
 
 
 def get_model_state_file(checkpoint_dir, zero_stage):
+    """
+    获取模型状态文件路径
+    
+    参数：
+        checkpoint_dir: str - 检查点目录路径
+        zero_stage: int - ZeRO阶段（2或3）
+    
+    返回：
+        str - 模型状态文件的完整路径
+    
+    异常：
+        FileNotFoundError - 目录或文件不存在时抛出
+    """
     if not os.path.isdir(checkpoint_dir):
         raise FileNotFoundError(f"Directory '{checkpoint_dir}' doesn't exist")
 
-    # there should be only one file
+    # 根据ZeRO阶段确定模型状态文件名
     if zero_stage == 2:
         file = os.path.join(checkpoint_dir, "mp_rank_00_model_states.pt")
     elif zero_stage == 3:
@@ -75,7 +139,20 @@ def get_model_state_file(checkpoint_dir, zero_stage):
 
 
 def get_checkpoint_files(checkpoint_dir, glob_pattern):
-    # XXX: need to test that this simple glob rule works for multi-node setup too
+    """
+    获取匹配指定模式的检查点文件列表
+    
+    参数：
+        checkpoint_dir: str - 检查点目录路径
+        glob_pattern: str - 文件匹配模式
+    
+    返回：
+        list - 按自然顺序排序的检查点文件列表
+    
+    异常：
+        FileNotFoundError - 未找到匹配文件时抛出
+    """
+    # TODO: 需要测试此简单的glob规则是否适用于多节点设置
     ckpt_files = sorted(glob.glob(os.path.join(checkpoint_dir, glob_pattern)), key=natural_keys)
 
     if len(ckpt_files) == 0:
@@ -85,14 +162,47 @@ def get_checkpoint_files(checkpoint_dir, glob_pattern):
 
 
 def get_optim_files(checkpoint_dir):
+    """
+    获取优化器状态文件列表
+    
+    参数：
+        checkpoint_dir: str - 检查点目录路径
+    
+    返回：
+        list - 优化器状态文件路径列表
+    """
     return get_checkpoint_files(checkpoint_dir, "*_optim_states.pt")
 
 
 def get_model_state_files(checkpoint_dir):
+    """
+    获取模型状态文件列表
+    
+    参数：
+        checkpoint_dir: str - 检查点目录路径
+    
+    返回：
+        list - 模型状态文件路径列表
+    """
     return get_checkpoint_files(checkpoint_dir, "*_model_states.pt")
 
 
 def parse_model_states(files):
+    """
+    解析模型状态文件
+    
+    参数：
+        files: list - 模型状态文件路径列表
+    
+    返回：
+        list[zero_model_state] - 解析后的模型状态对象列表
+    
+    功能：
+        1. 加载模型状态字典
+        2. 提取缓冲区数据并转换为FP32
+        3. 收集参数形状信息
+        4. 处理共享参数和冻结参数
+    """
     zero_model_states = []
     for file in files:
         state_dict = torch.load(file, map_location=device)
@@ -103,24 +213,24 @@ def parse_model_states(files):
         if debug:
             print("Found buffers:", buffer_names)
 
-        # recover just the buffers while restoring them to fp32 if they were saved in fp16
+        # 恢复缓冲区数据，如果是FP16则转换为FP32
         buffers = {k: v.float() for k, v in state_dict["module"].items() if k in buffer_names}
         param_shapes = state_dict[PARAM_SHAPES]
 
-        # collect parameters that are included in param_shapes
+        # 收集包含在param_shapes中的参数名称
         param_names = []
         for s in param_shapes:
             for name in s.keys():
                 param_names.append(name)
 
-        # update with frozen parameters
+        # 处理冻结参数
         frozen_param_shapes = state_dict.get(FROZEN_PARAM_SHAPES, None)
         if frozen_param_shapes is not None:
             if debug:
                 print(f"Found frozen_param_shapes: {frozen_param_shapes}")
             param_names += list(frozen_param_shapes.keys())
 
-        # handle shared params
+        # 处理共享参数
         shared_params = [[k, v] for k, v in state_dict["shared_params"].items()]
 
         ds_version = state_dict.get(DS_VERSION, None)
@@ -139,7 +249,22 @@ def parse_model_states(files):
 
 
 def parse_optim_states(files, ds_checkpoint_dir):
-
+    """
+    解析优化器状态文件
+    
+    参数：
+        files: list - 优化器状态文件路径列表
+        ds_checkpoint_dir: str - DeepSpeed检查点目录路径
+    
+    返回：
+        tuple - (zero_stage, world_size, fp32_flat_groups)
+            - zero_stage: int - ZeRO阶段（2或3）
+            - world_size: int - 分布式训练的世界大小
+            - fp32_flat_groups: list - FP32扁平化参数组
+    
+    异常：
+        ValueError - 检查点格式错误或文件数量不匹配时抛出
+    """
     total_files = len(files)
     state_dicts = []
     for f in files:
@@ -150,10 +275,9 @@ def parse_optim_states(files, ds_checkpoint_dir):
     zero_stage = state_dicts[0][OPTIMIZER_STATE_DICT][ZERO_STAGE]
     world_size = state_dicts[0][OPTIMIZER_STATE_DICT][PARTITION_COUNT]
 
-    # For ZeRO-2 each param group can have different partition_count as data parallelism for expert
-    # parameters can be different from data parallelism for non-expert parameters. So we can just
-    # use the max of the partition_count to get the dp world_size.
-
+    # 对于ZeRO-2，每个参数组可能有不同的partition_count
+    # 专家参数的数据并行度可能与非专家参数不同
+    # 使用最大的partition_count作为dp world_size
     if type(world_size) is list:
         world_size = max(world_size)
 
@@ -163,7 +287,7 @@ def parse_optim_states(files, ds_checkpoint_dir):
             "Possibly due to an overwrite of an old checkpoint, or a checkpoint didn't get saved by one or more processes."
         )
 
-    # the groups are named differently in each stage
+    # 不同阶段的参数组命名不同
     if zero_stage == 2:
         fp32_groups_key = SINGLE_PARTITION_OF_FP32_GROUPS
     elif zero_stage == 3:
@@ -174,12 +298,8 @@ def parse_optim_states(files, ds_checkpoint_dir):
     if zero_stage == 2:
         fp32_flat_groups = [state_dicts[i][OPTIMIZER_STATE_DICT][fp32_groups_key] for i in range(len(state_dicts))]
     elif zero_stage == 3:
-        # if there is more than one param group, there will be multiple flattened tensors - one
-        # flattened tensor per group - for simplicity merge them into a single tensor
-        #
-        # XXX: could make the script more memory efficient for when there are multiple groups - it
-        # will require matching the sub-lists of param_shapes for each param group flattened tensor
-
+        # 如果有多个参数组，会有多个扁平化张量
+        # 为简化处理，将它们合并为单个张量
         fp32_flat_groups = [
             torch.cat(state_dicts[i][OPTIMIZER_STATE_DICT][fp32_groups_key], 0) for i in range(len(state_dicts))
         ]
@@ -189,11 +309,18 @@ def parse_optim_states(files, ds_checkpoint_dir):
 
 def _get_fp32_state_dict_from_zero_checkpoint(ds_checkpoint_dir):
     """
-    Returns fp32 state_dict reconstructed from ds checkpoint
-
-    Args:
-        - ``ds_checkpoint_dir``: path to the deepspeed checkpoint folder (where the optimizer files are)
-
+    从DeepSpeed检查点恢复FP32状态字典（内部函数）
+    
+    参数：
+        ds_checkpoint_dir: str - DeepSpeed检查点目录路径
+    
+    返回：
+        OrderedDict - 重建的FP32模型状态字典
+    
+    功能：
+        1. 解析优化器状态文件获取ZeRO阶段和分片信息
+        2. 解析模型状态文件获取参数形状
+        3. 根据ZeRO阶段调用相应的恢复函数
     """
     print(f"Processing zero checkpoint '{ds_checkpoint_dir}'")
 
@@ -458,36 +585,35 @@ def _get_fp32_state_dict_from_zero3_checkpoint(world_size, fp32_flat_groups, zer
 
 def get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir, tag=None):
     """
-    Convert ZeRO 2 or 3 checkpoint into a single fp32 consolidated state_dict that can be loaded with
-    ``load_state_dict()`` and used for training without DeepSpeed or shared with others, for example
-    via a model hub.
-
-    Args:
-        - ``checkpoint_dir``: path to the desired checkpoint folder
-        - ``tag``: checkpoint tag used as a unique identifier for checkpoint. If not provided will attempt to load tag in 'latest' file. e.g., ``global_step14``
-
-    Returns:
-        - pytorch ``state_dict``
-
-    Note: this approach may not work if your application doesn't have sufficient free CPU memory and
-    you may need to use the offline approach using the ``zero_to_fp32.py`` script that is saved with
-    the checkpoint.
-
-    A typical usage might be ::
-
+    从ZeRO 2或3检查点转换为单个FP32合并状态字典
+    
+    该函数将分布式训练保存的检查点转换为可以使用load_state_dict()加载的
+    标准PyTorch状态字典，适用于不依赖DeepSpeed的训练或与他人共享模型。
+    
+    参数：
+        checkpoint_dir: str - 检查点文件夹路径
+        tag: str, 可选 - 检查点标签（如'global_step14'）
+                        如果未提供，将尝试从'latest'文件读取
+    
+    返回：
+        dict - PyTorch状态字典
+    
+    注意：
+        如果应用程序没有足够的CPU内存，此方法可能无法工作。
+        可以使用离线方式，通过检查点保存的zero_to_fp32.py脚本进行转换。
+    
+    使用示例：
         from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
-        # do the training and checkpoint saving
-        state_dict = get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir) # already on cpu
-        model = model.cpu() # move to cpu
+        # 训练并保存检查点后
+        state_dict = get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir)  # 已在CPU上
+        model = model.cpu()  # 移动到CPU
         model.load_state_dict(state_dict)
-        # submit to model hub or save the model to share with others
-
-    In this example the ``model`` will no longer be usable in the deepspeed context of the same
-    application. i.e. you will need to re-initialize the deepspeed engine, since
-    ``model.load_state_dict(state_dict)`` will remove all the deepspeed magic from it.
-
-    If you want it all done for you, use ``load_state_dict_from_zero_checkpoint`` instead.
-
+        # 提交到模型中心或保存模型
+    
+    警告：
+        使用此函数后，模型将无法在同一应用程序的DeepSpeed上下文中继续使用。
+        需要重新初始化DeepSpeed引擎。
+        如果希望自动完成所有操作，请使用load_state_dict_from_zero_checkpoint。
     """
     if tag is None:
         latest_path = os.path.join(checkpoint_dir, 'latest')
@@ -507,15 +633,20 @@ def get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir, tag=None):
 
 def convert_zero_checkpoint_to_fp32_state_dict(checkpoint_dir, output_file, tag=None):
     """
-    Convert ZeRO 2 or 3 checkpoint into a single fp32 consolidated ``state_dict`` file that can be
-    loaded with ``torch.load(file)`` + ``load_state_dict()`` and used for training without DeepSpeed.
-
-    Args:
-        - ``checkpoint_dir``: path to the desired checkpoint folder. (one that contains the tag-folder, like ``global_step14``)
-        - ``output_file``: path to the pytorch fp32 state_dict output file (e.g. path/pytorch_model.bin)
-        - ``tag``: checkpoint tag used as a unique identifier for checkpoint. If not provided will attempt to load tag in the file named ``latest`` in the checkpoint folder, e.g., ``global_step14``
+    将ZeRO 2或3检查点转换为单个FP32合并状态字典文件
+    
+    转换后的文件可以使用torch.load()加载，然后用load_state_dict()加载到模型中，
+    无需DeepSpeed即可进行训练。
+    
+    参数：
+        checkpoint_dir: str - 检查点文件夹路径（包含tag文件夹的目录，如包含global_step14的目录）
+        output_file: str - PyTorch FP32状态字典输出文件路径（如path/pytorch_model.bin）
+        tag: str, 可选 - 检查点标签。如果未提供，将尝试从检查点文件夹中的'latest'文件加载
+    
+    功能：
+        1. 从检查点恢复FP32状态字典
+        2. 将状态字典保存到指定的输出文件
     """
-
     state_dict = get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir, tag)
     print(f"Saving fp32 state dict to {output_file}")
     torch.save(state_dict, output_file)
@@ -523,32 +654,33 @@ def convert_zero_checkpoint_to_fp32_state_dict(checkpoint_dir, output_file, tag=
 
 def load_state_dict_from_zero_checkpoint(model, checkpoint_dir, tag=None):
     """
-    1. Put the provided model to cpu
-    2. Convert ZeRO 2 or 3 checkpoint into a single fp32 consolidated ``state_dict``
-    3. Load it into the provided model
-
-    Args:
-        - ``model``: the model object to update
-        - ``checkpoint_dir``: path to the desired checkpoint folder. (one that contains the tag-folder, like ``global_step14``)
-        - ``tag``: checkpoint tag used as a unique identifier for checkpoint. If not provided will attempt to load tag in the file named ``latest`` in the checkpoint folder, e.g., ``global_step14``
-
-    Returns:
-        - ``model`: modified model
-
-    Make sure you have plenty of CPU memory available before you call this function. If you don't
-    have enough use the ``zero_to_fp32.py`` utility to do the conversion. You will find it
-    conveniently placed for you in the checkpoint folder.
-
-    A typical usage might be ::
-
+    从ZeRO检查点加载状态字典到模型
+    
+    完整流程：
+    1. 将模型移动到CPU
+    2. 将ZeRO 2或3检查点转换为单个FP32合并状态字典
+    3. 将状态字典加载到模型中
+    
+    参数：
+        model: nn.Module - 要更新的模型对象
+        checkpoint_dir: str - 检查点文件夹路径（包含tag文件夹的目录）
+        tag: str, 可选 - 检查点标签。如果未提供，将尝试从'latest'文件加载
+    
+    返回：
+        nn.Module - 加载了权重的模型
+    
+    注意：
+        调用此函数前请确保有足够的CPU内存。
+        如果内存不足，请使用检查点文件夹中的zero_to_fp32.py工具进行离线转换。
+    
+    使用示例：
         from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
         model = load_state_dict_from_zero_checkpoint(trainer.model, checkpoint_dir)
-        # submit to model hub or save the model to share with others
-
-    Note, that once this was run, the ``model`` will no longer be usable in the deepspeed context
-    of the same application. i.e. you will need to re-initialize the deepspeed engine, since
-    ``model.load_state_dict(state_dict)`` will remove all the deepspeed magic from it.
-
+        # 提交到模型中心或保存模型
+    
+    警告：
+        运行此函数后，模型将无法在同一应用程序的DeepSpeed上下文中继续使用。
+        需要重新初始化DeepSpeed引擎，因为load_state_dict()会移除所有DeepSpeed相关功能。
     """
     logger.info(f"Extracting fp32 weights")
     state_dict = get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir, tag)
@@ -560,17 +692,21 @@ def load_state_dict_from_zero_checkpoint(model, checkpoint_dir, tag=None):
     return model
 
 
+# =========================================
+# 命令行入口
+# 使用方法：python zero_to_fp32.py <checkpoint_dir> <output_file>
+# =========================================
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("checkpoint_dir",
                         type=str,
-                        help="path to the desired checkpoint folder, e.g., path/checkpoint-12")
+                        help="检查点文件夹路径，例如：path/checkpoint-12")
     parser.add_argument(
         "output_file",
         type=str,
-        help="path to the pytorch fp32 state_dict output file (e.g. path/checkpoint-12/pytorch_model.bin)")
-    parser.add_argument("-d", "--debug", action='store_true', help="enable debug")
+        help="PyTorch FP32状态字典输出文件路径，例如：path/checkpoint-12/pytorch_model.bin")
+    parser.add_argument("-d", "--debug", action='store_true', help="启用调试模式")
     args = parser.parse_args()
 
     debug = args.debug
